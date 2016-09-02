@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"log"
 	"math"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
-var (
-	const BufferLength = 2048
-)
+const BufferLength = 2048
 
 type Peer struct {
 	Debug    bool
@@ -122,7 +126,7 @@ func (p *Peer) CheckLivePeers() {
 	for host, port := range p.Peers {
 		peerID := fmt.Sprintf("%s:%d", host, port)
 
-		conn, err := net.Dial("tcp", host + ":" + string(port))
+		conn, err := net.Dial("tcp", host+":"+string(port))
 		if err != nil {
 			log.Printf("Error dialing %s: %s", peerID, err.Error())
 		} else {
