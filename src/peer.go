@@ -1,45 +1,48 @@
 package main
 
 import (
-	"bufio"
+	"crypto/sha1"
+	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"log"
 	"math"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const BufferLength = 2048
-
 type Peer struct {
-	Debug    bool
+	Hash     hash.Hash
 	MaxPeers int
-	Port     int
+	Port     string
 	Host     string
 	PeerID   string
 	PeerLock *sync.Mutex
-	Peers    map[string]int
-	Shutdown bool
-	Handlers map[string]http.HandleFunc
+	Peers    map[string]net.Addr
+	shutdown bool
+	Handler  *Handler
 }
 
 func NewPeer(maxPeers int) *Peer {
 	p := &Peer{
-		Debug:    false,
-		MaxPeers: maxPeers,
-		Port:     80,
-		Peers:    make(map[string]int),
-		Handlers: make(map[string]http.HandleFunc),
+		Hash:     sha1.New(),
+		MaxPeers: peers,
+		Port:     "8888",
+		Peers:    make(map[string]net.Addr),
+		shutdown: false,
 	}
 
 	if maxPeers == 0 {
 		p.MaxPeers = math.MaxInt64
 	}
+
+	p.Handler = &Handler{Server: p}
 
 	p.init()
 
@@ -48,10 +51,10 @@ func NewPeer(maxPeers int) *Peer {
 
 func (p *Peer) init() {
 	// we need to get the ip address of our machine
-	ifaces, err := net.Interfaces()
+	ifaces, _ := net.Interfaces()
 	// handle err
 	for _, i := range ifaces {
-		addrs, err := i.Addrs()
+		addrs, _ := i.Addrs()
 		// handle err
 		for _, addr := range addrs {
 			var ip net.IP
@@ -63,7 +66,8 @@ func (p *Peer) init() {
 			}
 			// process IP address
 			p.Host = ip.String()
-			p.PeerID = p.Host + ":" + p.Port
+			io.WriteString(p.Hash, fmt.Sprintf("%s:%s", p.Host, p.Port))
+			p.PeerID = fmt.Sprintf("%x", p.Hash.Sum(nil))
 		}
 	}
 }
@@ -76,83 +80,78 @@ func (p *Peer) Start() {
 
 	defer l.Close()
 
-	log.Printf("Peer [%s] listening on %s:%d", p.PeerID, p.Host, p.Port)
+	log.Printf("Peer [%s] listening on 127.0.0.1:8888 and has a registered IP of %s:%s", p.PeerID, p.Host, p.Port)
 
 	go p.listenForShutdown()
 
-	for !p.Shutdown {
+	go p.CheckLivePeers()
+
+	for !p.shutdown {
 		conn, err := l.Accept()
 		if err != nil {
 			log.Printf("Error accepting request from %s: %s", conn.RemoteAddr().String(), err.Error())
 		}
 
-		go handleRequest(conn)
+		go p.Handler.HandleRequest(conn)
 	}
 
 	log.Printf("Peer [%s] is shutting down.\n", p.PeerID)
 }
 
-func (p *Peer) SetDebug(debug bool) {
-	p.Debug = debug
-}
-
 func (p *Peer) Shutdown() {
-	p.Shutdown = true
+	p.shutdown = true
 }
 
-func (p *Peer) AddPeer(peerID string) {
+func (p *Peer) AddPeer(peerID string, addr net.Addr) error {
 	p.PeerLock.Lock()
 	defer p.PeerLock.Unlock()
-	if _, ok := p.Peers[peerID]; !ok {
-		p.Peers[peerID] = 1
-	} else {
-		log.Printf("Peer [%s] already in list of know peers.\n", peerID)
+	if len(p.Peers) == p.MaxPeers {
+		return errors.New("Max peer limit has been reached for peer: " + p.PeerID)
 	}
+
+	if _, ok := p.Peers[peerID]; !ok {
+		p.Peers[peerID] = addr
+		log.Println("Added", peerID, "to list of known peers")
+		return nil
+	}
+
+	log.Printf("Peer [%s] already in list of know peers.\n", peerID)
+	return nil
 }
 
 func (p *Peer) RemovePeer(peerID string) error {
 	p.PeerLock.Lock()
 	defer p.PeerLock.Unlock()
 	if _, ok := p.Peers[peerID]; ok {
-		delete(p.Peers[peerID])
-	} else {
-		log.Printf("Unable to remove peer [%s] from list of know peers", peerID)
+		delete(p.Peers, peerID)
+		log.Println("Successfully removed peer:", peerID)
+		return nil
 	}
+	log.Printf("Unable to remove peer [%s] from list of know peers", peerID)
+
+	return fmt.Errorf("Peer [%s] not found in known peers", peerID)
 }
 
 func (p *Peer) CheckLivePeers() {
-	toDelete := make([]string, 0)
+	ticker := time.NewTicker(time.Minute * 5)
 
-	for host, port := range p.Peers {
-		peerID := fmt.Sprintf("%s:%d", host, port)
+	defer ticker.Stop()
+	for range ticker.C {
+		if p.shutdown {
+			return
+		}
+		log.Println("Checking if known peers are alive...")
 
-		conn, err := net.Dial("tcp", host+":"+string(port))
-		if err != nil {
-			log.Printf("Error dialing %s: %s", peerID, err.Error())
-		} else {
-			conn.Write(`PING`)
-			status, err := bufio.NewReader(conn).ReadString("\n")
-			if err != nil {
-				log.Printf("Error recieving PING from %s\n", peerID, err.Error())
+		for _, addr := range p.Peers {
+			peerID := fmt.Sprintf("%s:%s", addr.String(), p.Port)
+
+			if !p.Handler.Ping(peerID) {
+				log.Println("Unable to ping:", peerID)
+				log.Println("Removing peer:", peerID)
 				p.RemovePeer(peerID)
-			} else {
-				log.Printf("Successful response from %s\n", peerID)
 			}
 		}
 	}
-}
-
-func handleRequest(conn net.Conn) {
-	buffer := make([]byte, BufferLength)
-
-	reqLen, err := conn.Read(buffer)
-	if err != nil {
-		log.Printf("Error reading message from connection [%s]: %s\n", conn.RemoteAddr().String(), err.Error())
-	}
-
-	conn.Write([]byte("Message Recieved\n"))
-
-	conn.Close()
 }
 
 func (p *Peer) listenForShutdown() {
@@ -165,6 +164,7 @@ func (p *Peer) listenForShutdown() {
 
 			msg = "Shutdown in progress."
 			p.Shutdown()
+			return
 		}
 	}()
 }
