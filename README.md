@@ -1,4 +1,4 @@
-#p2p
+# p2p
 
 A simple peer to peer network that communicates over tcp. This is currently being
 expanded upon to demonstrate various distributed data structures and mostly a pet
